@@ -24,8 +24,11 @@ import org.apache.maven.plugin.descriptor.MojoDescriptor;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.settings.Server;
 import org.codehaus.plexus.component.annotations.Component;
+import org.codehaus.plexus.component.configurator.expression.ExpressionEvaluationException;
 import org.codehaus.plexus.component.configurator.expression.ExpressionEvaluator;
+import org.codehaus.plexus.util.xml.Xpp3Dom;
 
+import java.lang.reflect.InvocationTargetException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -35,6 +38,8 @@ import java.util.Properties;
  */
 @Component(role = AbstractMavenLifecycleParticipant.class)
 public class ServersExtension extends AbstractMavenLifecycleParticipant {
+
+    private static final String PROPERTY_PREFIX = "settings.servers.";
 
     private static final String[] FIELDS = new String[]{"username", "password", "passphrase", "privateKey",
         "filePermissions", "directoryPermissions"};
@@ -47,28 +52,16 @@ public class ServersExtension extends AbstractMavenLifecycleParticipant {
         Map<String, String> properties = new HashMap<String, String>();
         try {
             for (Server server : session.getSettings().getServers()) {
-                String serverId = server.getId();
-                for (String field : FIELDS) {
-                    String[] aliases = getAliases(serverId, field);
-                    String fieldNameWithFirstLetterCapitalized = upperCaseFirstLetter(field);
-                    String fieldValue = (String) Server.class.
-                        getMethod("get" + fieldNameWithFirstLetterCapitalized).invoke(server);
-                    for (String alias : aliases) {
-                        String userPropertyValue = userProperties.getProperty(alias);
-                        if (userPropertyValue != null) {
-                            fieldValue = userPropertyValue;
-                            break;
-                        }
-                    }
-                    String resolvedValue = (String) expressionEvaluator.evaluate(fieldValue);
-                    Server.class.getMethod("set" + fieldNameWithFirstLetterCapitalized, new Class[]{String.class}).
-                        invoke(server, resolvedValue);
-                    if (resolvedValue != null) {
-                        for (String alias : aliases) {
-                            properties.put(alias, resolvedValue);
-                        }
+                String prefix = PROPERTY_PREFIX + server.getId() + ".";
+                
+                Object configuration = server.getConfiguration();
+                if (configuration instanceof Xpp3Dom) {
+                    for (Xpp3Dom child : ((Xpp3Dom) configuration).getChildren()) {
+                        extractConfigurationFields(child, prefix, expressionEvaluator, userProperties, properties);
                     }
                 }
+                
+                extractServerFields(server, prefix, expressionEvaluator, userProperties, properties);
             }
             for (MavenProject project : session.getProjects()) {
                 project.getProperties().putAll(properties);
@@ -78,11 +71,46 @@ public class ServersExtension extends AbstractMavenLifecycleParticipant {
         }
     }
 
-    private String[] getAliases(String serverId, String field) {
-        return new String[]{
-            "settings.servers." + serverId + "." + field,
-            "settings.servers.server." + serverId + "." + field, // legacy syntax, left for backward compatibility
-        };
+    private void extractServerFields(Server server, String prefix, ExpressionEvaluator expressionEvaluator, Properties userProperties, Map<String,String> properties) throws IllegalAccessException, InvocationTargetException, NoSuchMethodException, ExpressionEvaluationException {
+        for (String field : FIELDS) {
+            String fieldNameWithFirstLetterCapitalized = upperCaseFirstLetter(field);
+            String fieldValue = (String) Server.class.getMethod("get" + fieldNameWithFirstLetterCapitalized).invoke(server);
+            fieldValue = getUserPropertyValue(userProperties, field, fieldValue);
+            String resolvedValue = (String) expressionEvaluator.evaluate(fieldValue);
+            
+            Server.class.getMethod("set" + fieldNameWithFirstLetterCapitalized, new Class[]{String.class}).invoke(server, resolvedValue);
+            if (resolvedValue != null) {
+                properties.put(prefix + field, resolvedValue);
+            }
+        }
+    }
+
+    private void extractConfigurationFields(Xpp3Dom node, String prefix, ExpressionEvaluator expressionEvaluator, Properties userProperties, Map<String,String> properties) throws ExpressionEvaluationException {
+        if (node.getChildCount() > 0) {
+            for (Xpp3Dom childNode: node.getChildren()) {
+                String childPrefix = prefix + childNode.getName() + ".";
+                extractConfigurationFields(childNode, childPrefix, expressionEvaluator, userProperties, properties);
+            }
+        }
+        else {
+            String field = prefix + node.getName();
+            String fieldValue = node.getValue();
+            fieldValue = getUserPropertyValue(userProperties, field, fieldValue);
+            String resolvedValue = (String) expressionEvaluator.evaluate(fieldValue);
+            
+            node.setValue(resolvedValue);
+            if (resolvedValue != null) {
+                properties.put(field, resolvedValue);
+            }
+        }
+    }
+
+    private String getUserPropertyValue(Properties userProperties, String field, String fieldValue) {
+        String userPropertyValue = userProperties.getProperty(field);
+        if (userPropertyValue != null) {
+            fieldValue = userPropertyValue;
+        }
+        return fieldValue;
     }
 
     private String upperCaseFirstLetter(String string) {
